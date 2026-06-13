@@ -1798,38 +1798,45 @@ class WooProductTemplateEpt(models.Model):
         # Loop through WooCommerce variants to process them
         for variant in product_response["variations"]:
             # ======================================================================
-            # 🔴 GEMINI 终极源头劫持黑科技：在进入循环的第一步，直接把 WooCommerce 的原始数据改掉
+            # 🔴 GEMINI 终极纠正版：利用正确的入参 order_data_line 强制劫持源头数据
             # ======================================================================
-            if not product_response.get('_prices_normalized'):
-                # 1. 收集所有变体的原价，算出最低基准价
+            # 从原厂传入的订单/队列对象中提取真正的 WooCommerce 原始 JSON 字典
+            product_response_data = order_data_line.woo_product_data if hasattr(order_data_line, 'woo_product_data') else {}
+            if isinstance(product_response_data, str):
+                import json
+                try:
+                    product_response_data = json.loads(product_response_data)
+                except Exception:
+                    product_response_data = {}
+
+            if product_response_data and not product_response_data.get('_prices_normalized'):
                 all_v_prices = []
-                for v in product_response.get("variations", []):
-                    p = float(v.get("regular_price") or v.get("price") or 0.0)
-                    if p > 0:
-                        all_v_prices.append(p)
+                variations_list = product_response_data.get("variations", []) if isinstance(product_response_data.get("variations"), list) else product_response_data.get("variations", {}).values()
+                for v in variations_list:
+                    if isinstance(v, dict):
+                        p = float(v.get("regular_price") or v.get("price") or 0.0)
+                        if p > 0:
+                            all_v_prices.append(p)
                 v_min_price = min(all_v_prices) if all_v_prices else 0.0
                 
-                # 2. 强行把最低价和差价，直接写死到 WooCommerce 传过来的原始字典数据流中！
-                for v in product_response.get("variations", []):
-                    orig_price = float(v.get("regular_price") or v.get("price") or 0.0)
-                    # 强行修改原始 regular_price 为变体本应该在 Odoo 里产生的 price_extra 溢价！
-                    # 这样原厂后续不管怎么用原生代码去写 price_extra，写入的都是我们算好的正确差价！
-                    v['regular_price'] = str(orig_price - v_min_price)
-                    v['price'] = str(orig_price - v_min_price)
-                    
-                    # 同样处理特价
-                    orig_sale = float(v.get("sale_price") or 0.0)
-                    if orig_sale > 0:
-                        v['sale_price'] = str(orig_sale - v_min_price)
+                for v in variations_list:
+                    if isinstance(v, dict):
+                        orig_price = float(v.get("regular_price") or v.get("price") or 0.0)
+                        # 强行将原始价格修改为“变体应该在 Odoo 里产生的差价”
+                        v['regular_price'] = str(orig_price - v_min_price)
+                        v['price'] = str(orig_price - v_min_price)
+                        
+                        orig_sale = float(v.get("sale_price") or 0.0)
+                        if orig_sale > 0:
+                            v['sale_price'] = str(orig_sale - v_min_price)
                 
-                # 标记已清洗，防止内层重复触发
-                product_response['_prices_normalized'] = True
-                product_response['_min_base_price'] = v_min_price
+                product_response_data['_prices_normalized'] = True
+                product_response_data['_min_base_price'] = v_min_price
 
-            # 3. 强行将算出的最低基准价，直接写进产品模板对应的基础 regular_price 里！
-            if product_response.get('_min_base_price'):
-                product_response['regular_price'] = str(product_response['_min_base_price'])
-                product_response['price'] = str(product_response['_min_base_price'])
+            # 强行把最低价作为产品模板的基础售价，阻断原厂的 1 元回滚
+            if product_response_data and product_response_data.get('_min_base_price'):
+                product_response_data['regular_price'] = str(product_response_data['_min_base_price'])
+                product_response_data['price'] = str(product_response_data['_min_base_price'])
             # ======================================================================
             variant_id = variant.get("id")
             product_sku = variant.get("sku")
@@ -1968,6 +1975,40 @@ class WooProductTemplateEpt(models.Model):
                         product_dict.update({'product_tmpl_id': woo_template.product_tmpl_id, 'is_image': True})
                     self.update_product_images(product_response["images"], variant["image"], woo_template, woo_product, template_images_updated, product_dict)
                     template_images_updated = True
+            # ======================================================================
+            # 🔴 GEMINI 终极纠正版：强制修复原厂价格表（Pricelist）及强制锁死价格
+            # ======================================================================
+            try:
+                product_response_data = order_data_line.woo_product_data if hasattr(order_data_line, 'woo_product_data') else {}
+                if isinstance(product_response_data, str):
+                    import json
+                    try: product_response_data = json.loads(product_response_data)
+                    except Exception: pass
+                    
+                v_base_min = product_response_data.get('_min_base_price', 0.0) if isinstance(product_response_data, dict) else 0.0
+                
+                if update_price and woo_template and woo_template.product_tmpl_id and v_base_min > 0:
+                    # 强行把被原厂覆盖成 1 的产品模板价格，重新修正并强制刷入数据库
+                    woo_template.product_tmpl_id.write({'list_price': v_base_min})
+                    woo_template.product_tmpl_id.env.flush_all()
+                    
+                    # 遍历模板下的所有子变体，精准写入中间层 ID 激活价格表
+                    for product_id in woo_template.product_tmpl_id.product_variant_ids:
+                        # 捞出当前变体对应的真实 WooCommerce 原始价格
+                        v_reg_price = v_base_min + product_id.price_extra
+                        
+                        woo_product_for_price = self.env['woo.product.product.ept'].search([
+                            ('product_id', '=', product_id.id),
+                            ('woo_instance_id', '=', woo_instance.id)
+                        ], limit=1)
+                        
+                        if woo_product_for_price:
+                            # 强行修正原厂参数：传入中间层对象 ID
+                            woo_instance.woo_pricelist_id.set_product_price_ept(woo_product_for_price.id, v_reg_price)
+                            woo_instance.woo_pricelist_id.env.flush_all()
+            except Exception:
+                pass
+            # ======================================================================
 
         return woo_template
 
