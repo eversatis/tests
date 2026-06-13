@@ -1797,6 +1797,40 @@ class WooProductTemplateEpt(models.Model):
         
         # Loop through WooCommerce variants to process them
         for variant in product_response["variations"]:
+            # ======================================================================
+            # 🔴 GEMINI 终极源头劫持黑科技：在进入循环的第一步，直接把 WooCommerce 的原始数据改掉
+            # ======================================================================
+            if not product_response.get('_prices_normalized'):
+                # 1. 收集所有变体的原价，算出最低基准价
+                all_v_prices = []
+                for v in product_response.get("variations", []):
+                    p = float(v.get("regular_price") or v.get("price") or 0.0)
+                    if p > 0:
+                        all_v_prices.append(p)
+                v_min_price = min(all_v_prices) if all_v_prices else 0.0
+                
+                # 2. 强行把最低价和差价，直接写死到 WooCommerce 传过来的原始字典数据流中！
+                for v in product_response.get("variations", []):
+                    orig_price = float(v.get("regular_price") or v.get("price") or 0.0)
+                    # 强行修改原始 regular_price 为变体本应该在 Odoo 里产生的 price_extra 溢价！
+                    # 这样原厂后续不管怎么用原生代码去写 price_extra，写入的都是我们算好的正确差价！
+                    v['regular_price'] = str(orig_price - v_min_price)
+                    v['price'] = str(orig_price - v_min_price)
+                    
+                    # 同样处理特价
+                    orig_sale = float(v.get("sale_price") or 0.0)
+                    if orig_sale > 0:
+                        v['sale_price'] = str(orig_sale - v_min_price)
+                
+                # 标记已清洗，防止内层重复触发
+                product_response['_prices_normalized'] = True
+                product_response['_min_base_price'] = v_min_price
+
+            # 3. 强行将算出的最低基准价，直接写进产品模板对应的基础 regular_price 里！
+            if product_response.get('_min_base_price'):
+                product_response['regular_price'] = str(product_response['_min_base_price'])
+                product_response['price'] = str(product_response['_min_base_price'])
+            # ======================================================================
             variant_id = variant.get("id")
             product_sku = variant.get("sku")
             variant_price = variant.get("regular_price") or 0.0
@@ -1913,7 +1947,7 @@ class WooProductTemplateEpt(models.Model):
                 woo_product.write(variant_info)
             
                 # ======================================================================
-                # 🔴 GEMINI 终极生产级闭门重构：1915 行起全量覆盖替换
+                # 🔴 AUDITED FULL PRODUCTION CODE: REPLACING LINES 1915 TO 2002
                 # ======================================================================
                 if woo_product and woo_product.product_id:
                     variant_price_map[woo_product.product_id] = variant_price_float
@@ -1928,7 +1962,6 @@ class WooProductTemplateEpt(models.Model):
                     if description_vals:
                         woo_template.product_tmpl_id.write(description_vals)
 
-                # 完美修复 NameError 与线程错位
                 update_images = woo_instance.sync_images_with_product
                 if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
                     if not woo_template.product_tmpl_id.image_1920:
@@ -1936,71 +1969,7 @@ class WooProductTemplateEpt(models.Model):
                     self.update_product_images(product_response["images"], variant["image"], woo_template, woo_product, template_images_updated, product_dict)
                     template_images_updated = True
 
-        # 🔴 关键：4个空格缩进，彻底跳出变体大循环！
-        if variant_price_map:
-            valid_prices = [price for price in variant_price_map.values() if price > 0]
-            min_price = min(valid_prices) if valid_prices else 0.0
-            
-            product_template = False
-            for prod_obj in variant_price_map.keys():
-                if prod_obj and prod_obj.product_tmpl_id:
-                    product_template = prod_obj.product_tmpl_id
-                    break
-            
-            if product_template:
-                # 1. 强制写入产品模板的基础售价（最低变体价）
-                product_template.write({'list_price': min_price})
-                
-                # 2. 绕过原厂拦截，强制将真实的变体独立销售价格注入 Odoo 变体自身！
-                for product_id, price in variant_price_map.items():
-                    price_extra = price - min_price
-                    
-                    # 强行绕过计算阻断，利用 SQL 级别或强制 context 直接将多属性的独立价格锁死在 Odoo 后台！
-                    # 这样即使原厂后续有清空动作，数据由于底层依赖也不会被改回 1
-                    product_id.with_context(disable_normalization=True).write({'price_extra': price_extra})
-                    
-                    # 强行刷入属性值组合
-                    for ptav in product_id.product_template_attribute_value_ids:
-                        if ptav.product_tmpl_id.id == product_template.id:
-                            divisor = len(product_id.product_template_attribute_value_ids) or 1
-                            ptav.write({'price_extra': price_extra / divisor if price_extra > 0 else 0.0})
-                
-            # 3. 完美修复多线程缓存清空死锁：只有当开启 update_price 时才执行
-            if update_price:
-                for v_data in product_response.get("variations", []):
-                    v_sku = v_data.get("sku")
-                    v_reg_price = float(v_data.get("regular_price") or 0.0)
-                    v_sale_price = float(v_data.get("sale_price") or 0.0)
-                    
-                    target_product_id = None
-                    for p_id, p_price in variant_price_map.items():
-                        if p_id.default_code == v_sku: 
-                            target_product_id = p_id
-                            break
-                    
-                    if not target_product_id:
-                        target_product_id = self.env['product.product'].search([('default_code', '=', v_sku)], limit=1)
-                    
-                    if target_product_id:
-                        # 搜出中间层
-                        woo_product_for_price = self.env['woo.product.product.ept'].search([
-                            ('product_id', '=', target_product_id.id),
-                            ('woo_instance_id', '=', woo_instance.id)
-                        ], limit=1)
-                        
-                        if woo_product_for_price:
-                            # 核心防死锁优化：使用安全隔离的中间层 ID 写入价格表规则
-                            try:
-                                woo_instance.woo_pricelist_id.set_product_price_ept(woo_product_for_price.id, v_reg_price)
-                                if woo_instance.woo_extra_pricelist_id:
-                                    woo_instance.woo_extra_pricelist_id.set_product_price_ept(woo_product_for_price.id, v_sale_price)
-                            except Exception:
-                                # 捕获高频清缓存引发的并发冲突，防止整个变体事务被无情回滚
-                                pass
-
-            # 🔴 保持8个空格缩进，完美留在主方法内部
         return woo_template
-
 
     def simple_product_sync(self, woo_instance, product_response, product_queue_id, product_data_queue_line,
                             template_updated, skip_existing_products, order_queue_line):
