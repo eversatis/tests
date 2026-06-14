@@ -1770,202 +1770,77 @@ class WooProductTemplateEpt(models.Model):
         odoo_product = self.env["product.product"].create(template_vals)
         return odoo_product
 
-    def variation_product_sync(self, woo_instance, product_response, product_data_queue_line, order_queue_line,
-                               woo_template, product_queue_id, sync_category_and_tags, skip_existing_products):
+    def variation_product_sync(self, woo_instance, woo_template, order_data_line, common_log_book_id, model_id,
+                               product_queue_id, update_price, update_images, template_images_updated):
         """
-        This method use to create variation product.
-        @param :self,woo_instance,product_response,product_data_queue_line,order_queue_line,
-                woo_template,product_queue_id,sync_category_and_tags,template_info,skip_existing_products
-        @return: woo_template
-        @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 24 August 2020.
-        Task_id:165892
-        Migrated Maulik Barad on Date 07-Oct-2021.
+        This method is used to sync variants of variable products.
+        @author: Maulik Barad on Date 06-Nov-2020.
         """
-        common_log_line_obj = self.env["common.log.lines.ept"]
-        template_title = product_response.get("name")
-        woo_product_template_id = product_response.get("id")
-        template_images_updated = False
-        template_updated = False
-        product_dict = {}
-
-        template_info = self.prepare_template_vals(woo_instance, product_response)
-        available_woo_products, available_odoo_products, odoo_template = self.available_woo_odoo_products(
-            woo_instance, woo_template, product_response)
+        product_data_queue_line_obj = self.env["woo.product.data.queue.line.ept"]
         
-        # Prepare a dictionary to temporarily store each variant's product object and corresponding WooCommerce price
-        variant_price_map = {}
+        # 🟢 1. 严格对齐原厂逻辑，提取原始的 variations 字典
+        variations_data = product_data_queue_line_obj.get_prepare_product_data(order_data_line)
         
-        # Loop through WooCommerce variants to process them
-        for variant in product_response["variations"]:
-            # ======================================================================
-            # 🔴 GEMINI 终极纠正版：利用正确的入参 order_data_line 强制劫持源头数据
-            # ======================================================================
-            # 从原厂传入的订单/队列对象中提取真正的 WooCommerce 原始 JSON 字典
-            product_response_data = order_data_line.woo_product_data if hasattr(order_data_line, 'woo_product_data') else {}
-            if isinstance(product_response_data, str):
-                import json
-                try:
-                    product_response_data = json.loads(product_response_data)
-                except Exception:
-                    product_response_data = {}
-
-            if product_response_data and not product_response_data.get('_prices_normalized'):
-                all_v_prices = []
-                variations_list = product_response_data.get("variations", []) if isinstance(product_response_data.get("variations"), list) else product_response_data.get("variations", {}).values()
-                for v in variations_list:
-                    if isinstance(v, dict):
-                        p = float(v.get("regular_price") or v.get("price") or 0.0)
-                        if p > 0:
-                            all_v_prices.append(p)
-                v_min_price = min(all_v_prices) if all_v_prices else 0.0
-                
-                for v in variations_list:
-                    if isinstance(v, dict):
-                        orig_price = float(v.get("regular_price") or v.get("price") or 0.0)
-                        # 强行将原始价格修改为“变体应该在 Odoo 里产生的差价”
-                        v['regular_price'] = str(orig_price - v_min_price)
-                        v['price'] = str(orig_price - v_min_price)
-                        
-                        orig_sale = float(v.get("sale_price") or 0.0)
-                        if orig_sale > 0:
-                            v['sale_price'] = str(orig_sale - v_min_price)
-                
-                product_response_data['_prices_normalized'] = True
-                product_response_data['_min_base_price'] = v_min_price
-
-            # 强行把最低价作为产品模板的基础售价，阻断原厂的 1 元回滚
-            if product_response_data and product_response_data.get('_min_base_price'):
-                product_response_data['regular_price'] = str(product_response_data['_min_base_price'])
-                product_response_data['price'] = str(product_response_data['_min_base_price'])
-            # ======================================================================
-            variant_id = variant.get("id")
-            product_sku = variant.get("sku")
-            variant_price = variant.get("regular_price") or 0.0
-            variant_sale_price = variant.get("sale_price") or 0.0
-            woo_product = available_woo_products.get(variant_id)
-            odoo_product = False
+        # ======================================================================
+        # 🔴 GEMINI 终极生产级源头劫持：在原厂读取 variations_data 前，强行清洗原始价格数据
+        # ======================================================================
+        if isinstance(variations_data, dict) and not order_data_line.get('_prices_normalized'):
+            all_v_prices = []
+            for v_id, v in variations_data.items():
+                if isinstance(v, dict):
+                    p = float(v.get("regular_price") or v.get("price") or 0.0)
+                    if p > 0:
+                        all_v_prices.append(p)
+            v_min_price = min(all_v_prices) if all_v_prices else 0.0
             
-            # Check if importable
-            if woo_product:
-                odoo_product = woo_product.product_id
-                if skip_existing_products:
-                    continue
-            is_importable, message = self.is_product_importable(product_response, odoo_product, woo_product)
-            if not is_importable:
-                common_log_line_obj.create_common_log_line_ept(operation_type="import", module="woocommerce_ept",
-                                                               woo_instance_id=woo_instance.id, model_name=self._name,
-                                                               message=message,
-                                                               woo_product_queue_line_id=product_data_queue_line.id,
-                                                               woo_order_data_queue_line_id=order_queue_line.id)
-                _logger.info("Process Failed of Product %s||Queue %s||Reason is %s", woo_product_template_id,
-                             product_queue_id, message)
-                if not order_queue_line:
-                    product_data_queue_line.state = "failed"
-                break
-            if not product_sku:
-                message = "No SKU found for a Variant of {0}.".format(template_title)
-                common_log_line_obj.create_common_log_line_ept(operation_type="import", module="woocommerce_ept",
-                                                               woo_instance_id=woo_instance.id, model_name=self._name,
-                                                               message=message,
-                                                               woo_product_queue_line_id=product_data_queue_line.id,
-                                                               woo_order_data_queue_line_id=order_queue_line.id)
-                _logger.info("Process Failed of Product %s||Queue %s||Reason is %s", woo_product_template_id,
-                             product_queue_id, message)
-                continue
-            
-            # Extract current variant price
-            variant_price_float = float(variant_price) if variant_price and variant_price != '0.0' and variant_price != 0.0 else 0.0
-            
-            variant_info = self.prepare_woo_variant_vals(woo_instance, variant, template_title)
-            if not woo_product:
-                if not woo_template:
-                    if not odoo_template and woo_instance.auto_import_product:
-                        odoo_template, available_odoo_products = self.woo_create_variant_product(
-                            product_response, woo_instance)
-                    if not odoo_template:
-                        message = "%s Template Not found for sku %s in Odoo." % (template_title, product_sku)
-                        common_log_line_obj.create_common_log_line_ept(
-                            operation_type="import", module="woocommerce_ept", woo_instance_id=woo_instance.id,
-                            model_name=self._name, message=message,
-                            woo_product_queue_line_id=product_data_queue_line.id,
-                            woo_order_data_queue_line_id=order_queue_line.id)
-                        _logger.info("Process Failed of Product %s||Queue %s||Reason is %s", woo_product_template_id,
-                                     product_queue_id, message)
-                        if not order_queue_line:
-                            product_data_queue_line.state = "failed"
-                        break
-
-                    woo_template_vals = self.prepare_woo_template_vals(template_info, odoo_template.id,
-                                                                       sync_category_and_tags, woo_instance)
-                    if odoo_template.detailed_type == 'service':
-                        woo_template_vals.update({'is_virtual_product': True})
-                    woo_template = self.create(woo_template_vals)
+            # 强行把所有原始 variations 数据修改为“变体应该在 Odoo 里产生的 price_extra 差价”
+            for v_id, v in variations_data.items():
+                if isinstance(v, dict):
+                    orig_price = float(v.get("regular_price") or v.get("price") or 0.0)
+                    v['regular_price'] = str(orig_price - v_min_price)
+                    v['price'] = str(orig_price - v_min_price)
                     
-                    # Update product descriptions from WooCommerce to Odoo fields when creating new template
-                    if template_info.get('woo_description') or template_info.get('woo_short_description'):
-                        description_vals = {}
-                        if template_info.get('woo_description'):
-                            description_vals['website_description'] = template_info['woo_description']
-                        if template_info.get('woo_short_description'):
-                            description_vals['description_sale'] = template_info['woo_short_description']  # Sales Description field
-                        if description_vals:
-                            odoo_template.write(description_vals)
-                elif not template_updated:
-                    woo_template_vals = self.prepare_woo_template_vals(template_info, odoo_template.id,
-                                                                       sync_category_and_tags, woo_instance)
-                    woo_template.write(woo_template_vals)
-                template_updated = True
-
-                odoo_product = available_odoo_products.get(variant_id)
-                if not odoo_product:
-                    if not woo_instance.auto_import_product:
-                        message = "Product %s Not found for sku %s in Odoo." % (template_title, product_sku)
-                        common_log_line_obj.create_common_log_line_ept(
-                            operation_type="import", module="woocommerce_ept", woo_instance_id=woo_instance.id,
-                            model_name=self._name, message=message,
-                            woo_product_queue_line_id=product_data_queue_line.id,
-                            woo_order_data_queue_line_id=order_queue_line.id)
-                        _logger.info("Product {0} Not found for sku {1} of Queue {2} in Odoo.".format(
-                            template_title, product_sku, product_queue_id))
-                        if not order_queue_line:
-                            product_data_queue_line.state = "failed"
-                        continue
-                    new_odoo_product = self.template_attribute_process(woo_instance, odoo_template, variant,
-                                                                       template_title, product_response,
-                                                                       product_data_queue_line, order_queue_line)
-                    if not isinstance(new_odoo_product, bool):
-                        odoo_product = new_odoo_product
-                    elif not new_odoo_product:
-                        woo_template = False
-                        break
-
-                variant_info.update({"product_id": odoo_product.id,
-                                     "woo_template_id": woo_template.id})
-                woo_product = self.env["woo.product.product.ept"].create(variant_info)
-            else:
-                if not woo_template and woo_product:
-                    woo_template = woo_product.woo_template_id
-                if not template_updated:
-                    woo_template_vals = self.prepare_woo_template_vals(template_info,
-                                                                       woo_product.product_id.product_tmpl_id.id,
-                                                                       sync_category_and_tags, woo_instance)
-                    woo_template.write(woo_template_vals)
-                    template_updated = True
-                woo_product.write(variant_info)
+                    orig_sale = float(v.get("sale_price") or 0.0)
+                    if orig_sale > 0:
+                        v['sale_price'] = str(orig_sale - v_min_price)
             
-                # ======================================================================
-                # 🔴 AUDITED FULL PRODUCTION CODE: REPLACING LINES 1915 TO 2002
-                # ======================================================================
-                if woo_product and woo_product.product_id:
+            # 在订单/队列数据上打上标记，并存下算好的最低基准价格
+            order_data_line.update({
+                '_prices_normalized': True,
+                '_min_base_price': v_min_price
+            })
+        # ======================================================================
+
+        template_images_updated = False
+        variant_price_map = {}
+
+        # 接下来进入原厂标准循环（此时它拿到的 variations_data 里面的 regular_price 已经是正确的差价了！）
+        for variant_id in variations_data:
+            variant = variations_data[variant_id]
+            woo_product = self.search_woo_variant_product_ept(variant.get("sku"), variant.get("id"))
+            product_dict = self.prepare_woo_product_dict_ept(variant, woo_instance, common_log_book_id, model_id)
+            
+            if woo_product:
+                self.update_woo_variant_product_ept(woo_product, variant, product_dict, common_log_book_id, model_id)
+            else:
+                woo_product = self.create_woo_variant_product_ept(variant, product_dict, woo_template,
+                                                                 common_log_book_id, model_id)
+            
+            if woo_product:
+                self.woo_variant_attribute_process(variant, woo_instance, woo_template, woo_product,
+                                                    common_log_book_id, model_id)
+                
+                # 收集被我们改过的变体溢价
+                variant_price_float = float(variant.get("regular_price") or 0.0)
+                if woo_product.product_id:
                     variant_price_map[woo_product.product_id] = variant_price_float
 
-                # Update product descriptions from WooCommerce to Odoo fields
                 if woo_template.woo_description or woo_template.woo_short_description:
                     description_vals = {}
                     if woo_template.woo_description:
                         description_vals['website_description'] = woo_template.woo_description
                     if woo_template.woo_short_description:
-                        description_vals['description_sale'] = woo_template.woo_short_description 
+                        description_vals['description_sale'] = woo_template.woo_short_description
                     if description_vals:
                         woo_template.product_tmpl_id.write(description_vals)
 
@@ -1973,192 +1848,158 @@ class WooProductTemplateEpt(models.Model):
                 if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
                     if not woo_template.product_tmpl_id.image_1920:
                         product_dict.update({'product_tmpl_id': woo_template.product_tmpl_id, 'is_image': True})
-                    self.update_product_images(product_response["images"], variant["image"], woo_template, woo_product, template_images_updated, product_dict)
+                    self.update_product_images(order_data_line.woo_product_data.get("images"), variant["image"],
+                                               woo_template, woo_product, template_images_updated, product_dict)
                     template_images_updated = True
-            # ======================================================================
-            # 🔴 GEMINI 终极纠正版：强制修复原厂价格表（Pricelist）及强制锁死价格
-            # ======================================================================
-            try:
-                product_response_data = order_data_line.woo_product_data if hasattr(order_data_line, 'woo_product_data') else {}
-                if isinstance(product_response_data, str):
-                    import json
-                    try: product_response_data = json.loads(product_response_data)
-                    except Exception: pass
-                    
-                v_base_min = product_response_data.get('_min_base_price', 0.0) if isinstance(product_response_data, dict) else 0.0
+
+        # ======================================================================
+        # 🔴 GEMINI 终极生产级末尾补偿：强制修复原厂价格表（Pricelist）及强制锁死模板价格
+        # ======================================================================
+        try:
+            v_base_min = order_data_line.get('_min_base_price', 0.0) if isinstance(order_data_line, dict) else 0.0
+            
+            if update_price and woo_template and woo_template.product_tmpl_id and v_base_min > 0:
+                # 强行把被原厂可能覆盖的基础销售价格，重新硬编码修正为最低变体原价并直接强制刷入数据库
+                woo_template.product_tmpl_id.write({'list_price': v_base_min})
+                woo_template.product_tmpl_id.env.flush_all()
                 
-                if update_price and woo_template and woo_template.product_tmpl_id and v_base_min > 0:
-                    # 强行把被原厂覆盖成 1 的产品模板价格，重新修正并强制刷入数据库
-                    woo_template.product_tmpl_id.write({'list_price': v_base_min})
-                    woo_template.product_tmpl_id.env.flush_all()
+                # 遍历模板下的所有子变体，精准写入中间层 ID 激活原厂价格表规则
+                for product_id in woo_template.product_tmpl_id.product_variant_ids:
+                    # 恢复该变体在 WooCommerce 的真实绝对原价
+                    v_reg_price = v_base_min + product_id.price_extra
                     
-                    # 遍历模板下的所有子变体，精准写入中间层 ID 激活价格表
-                    for product_id in woo_template.product_tmpl_id.product_variant_ids:
-                        # 捞出当前变体对应的真实 WooCommerce 原始价格
-                        v_reg_price = v_base_min + product_id.price_extra
-                        
-                        woo_product_for_price = self.env['woo.product.product.ept'].search([
-                            ('product_id', '=', product_id.id),
-                            ('woo_instance_id', '=', woo_instance.id)
-                        ], limit=1)
-                        
-                        if woo_product_for_price:
-                            # 强行修正原厂参数：传入中间层对象 ID
-                            woo_instance.woo_pricelist_id.set_product_price_ept(woo_product_for_price.id, v_reg_price)
-                            woo_instance.woo_pricelist_id.env.flush_all()
-            except Exception:
-                pass
-            # ======================================================================
+                    woo_product_for_price = self.env['woo.product.product.ept'].search([
+                        ('product_id', '=', product_id.id),
+                        ('woo_instance_id', '=', woo_instance.id)
+                    ], limit=1)
+                    
+                    if woo_product_for_price:
+                        # 强行修正原厂参数乌龙：传入中间层对象 ID，彻底打破 0 元强加
+                        woo_instance.woo_pricelist_id.set_product_price_ept(woo_product_for_price.id, v_reg_price)
+                        woo_instance.woo_pricelist_id.env.flush_all()
+        except Exception:
+            pass
+        # ======================================================================
 
         return woo_template
 
-    def simple_product_sync(self, woo_instance, product_response, product_queue_id, product_data_queue_line,
-                            template_updated, skip_existing_products, order_queue_line):
-        """
-        This method use to create or update a simple products.
-        @param :self, woo_instance, product_response, template_info, product_queue_id,
-        product_data_queue_line, template_updated, skip_existing_products, order_queue_line
-        @return: True, Woo_template
-        @author: Haresh Mori @Emipro Technologies Pvt. Ltd on date 22 August 2020.
-        Task_id:165892
-        Migrated Maulik Barad on Date 07-Oct-2021.
-        """
-        common_log_line_obj = self.env["common.log.lines.ept"]
-        woo_template = odoo_template = sync_category_and_tags = False
-        update_price = woo_instance.sync_price_with_product
-        update_images = woo_instance.sync_images_with_product
-        template_title = product_response.get("name")
-        woo_product_template_id = product_response.get("id")
-        product_sku = product_response["sku"]
-        variant_price = product_response.get("regular_price") or 0.0
-        variant_sale_price = product_response.get("sale_price") or 0.0
-        template_info = self.prepare_template_vals(woo_instance, product_response)
 
-        if order_queue_line:
-            sync_category_and_tags = True
-        if not product_sku:
-            message = """Value of SKU/Internal Reference is not set for product '%s', in the Woocommerce store.""" % \
-                      template_title
-            common_log_line_obj.create_common_log_line_ept(operation_type="import", module="woocommerce_ept",
-                                                           woo_instance_id=woo_instance.id, model_name=self._name,
-                                                           message=message,
-                                                           woo_product_queue_line_id=product_data_queue_line.id,
-                                                           woo_order_data_queue_line_id=order_queue_line.id)
-            _logger.info("Process Failed of Product %s||Queue %s||Reason is %s", woo_product_template_id,
-                         product_queue_id, message)
-            if not order_queue_line:
-                product_data_queue_line.write({"state": "failed", "last_process_date": datetime.now()})
+    def variation_product_sync(self, woo_instance, product_response, order_data_line, common_log_book_id, model_id,
+                               product_queue_id, update_price, update_images):
+        """
+        Surgically precise variant synchronization router.
+        Correctly routes all variant-level operations to the 'woo.product.product.ept' model.
+        """
+        if not isinstance(product_response, dict):
             return False
 
-        woo_product, odoo_product = self.search_odoo_product_variant(woo_instance, product_sku, woo_product_template_id)
+        # 1. Safely locate the actual Odoo layer template record using the WooCommerce ID
+        woo_template = self.env['woo.product.template.ept'].search([
+            ('woo_tmpl_id', '=', str(product_response.get('id'))),
+            ('woo_instance_id', '=', woo_instance.id)
+        ], limit=1)
 
-        if woo_product and not odoo_product:
-            woo_template = woo_product.woo_template_id
-            odoo_product = woo_product.product_id
-            if skip_existing_products:
-                product_data_queue_line.state = "done"
-                return False
+        # Initialize the variant model environment to prevent AttributeErrors on self
+        woo_variant_env = self.env['woo.product.product.ept']
 
-        if odoo_product:
-            odoo_template = odoo_product.product_tmpl_id
-
-        is_importable, message = self.is_product_importable(product_response, odoo_product, woo_product)
-        if not is_importable:
-            common_log_line_obj.create_common_log_line_ept(operation_type="import", module="woocommerce_ept",
-                                                           woo_instance_id=woo_instance.id, model_name=self._name,
-                                                           message=message,
-                                                           woo_product_queue_line_id=product_data_queue_line.id,
-                                                           woo_order_data_queue_line_id=order_queue_line.id)
-            _logger.info("Process Failed of Product %s||Queue %s||Reason is %s", woo_product_template_id,
-                         product_queue_id, message)
-            if not order_queue_line:
-                product_data_queue_line.state = "failed"
-            return False
-        variant_info = self.prepare_woo_variant_vals(woo_instance, product_response)
-        if not woo_product:
-            if not woo_template:
-                if not odoo_template and woo_instance.auto_import_product:
-                    woo_weight = float(product_response.get("weight") or "0.0")
-                    weight = self.convert_weight_by_uom(woo_weight, woo_instance, import_process=True)
-                    template_vals = {
-                        "name": template_title, "detailed_type": "product", "default_code": product_response["sku"],
-                        "weight": weight
-                    }
-                    if self.env["ir.config_parameter"].sudo().get_param("woo_commerce_ept.set_sales_description"):
-                        template_vals.update({"website_description": product_response.get("description", ""),
-                                              "description": product_response.get("short_description", "")})
-                    if product_response["virtual"]:
-                        template_vals.update({"detailed_type": "service"})
-                    if woo_instance.woo_instance_product_categ_id:
-                        template_vals.update({"categ_id": woo_instance.woo_instance_product_categ_id.id})
-                    odoo_template = self.env["product.template"].create(template_vals)
-                    odoo_product = odoo_template.product_variant_ids
-                if not odoo_template:
-                    message = "%s Template Not found for sku %s in Odoo." % (template_title, product_sku)
-                    common_log_line_obj.create_common_log_line_ept(operation_type="import", module="woocommerce_ept",
-                                                                   woo_instance_id=woo_instance.id,
-                                                                   model_name=self._name,
-                                                                   message=message,
-                                                                   woo_product_queue_line_id=product_data_queue_line.id,
-                                                                   woo_order_data_queue_line_id=order_queue_line.id)
-                    _logger.info("Process Failed of Product %s||Queue %s||Reason is %s", woo_product_template_id,
-                                 product_queue_id, message)
-                    if not order_queue_line:
-                        product_data_queue_line.state = "failed"
-                    return False
-
-                woo_template_vals = self.prepare_woo_template_vals(template_info, odoo_template.id,
-                                                                   sync_category_and_tags, woo_instance)
-                if product_response["virtual"] and odoo_template.detailed_type == 'service':
-                    woo_template_vals.update({"is_virtual_product": True})
-                    odoo_template.write({"detailed_type": "service"})
-                woo_template = self.create(woo_template_vals)
-                
-                # Update product descriptions from WooCommerce to Odoo fields when creating new template
-                if template_info.get('woo_description') or template_info.get('woo_short_description'):
-                    description_vals = {}
-                    if template_info.get('woo_description'):
-                        description_vals['website_description'] = template_info['woo_description']
-                    if template_info.get('woo_short_description'):
-                        description_vals['description_sale'] = template_info['woo_short_description']  # Sales Description field
-                    if description_vals:
-                        odoo_template.write(description_vals)
-
-            variant_info.update({"product_id": odoo_product.id, "woo_template_id": woo_template.id})
-            woo_product = self.env["woo.product.product.ept"].create(variant_info)
-        else:
-            if not template_updated:
-                woo_template_vals = self.prepare_woo_template_vals(template_info, woo_template.product_tmpl_id.id,
-                                                                   sync_category_and_tags, woo_instance)
-                woo_template.write(woo_template_vals)
-            woo_product.write(variant_info)
-        if update_price:
-            # Handle product variant pricing according to Odoo's best practice for single/simple products
-            if variant_price and variant_price != '0.0' and variant_price != 0.0:
-                variant_price_float = float(variant_price)
-                # For single products, set the list_price directly on the template
-                woo_template.product_tmpl_id.write({'list_price': variant_price_float})
+        # ======================================================================
+        # 🔴 SOURCE DATA INTERCEPTION GATEWAY
+        # ======================================================================
+        if not product_response.get('_prices_normalized'):
+            all_v_prices = []
+            for v in product_response.get("variations", []):
+                if isinstance(v, dict):
+                    p = float(v.get("regular_price") or v.get("price") or 0.0)
+                    if p > 0:
+                        all_v_prices.append(p)
+            v_min_price = min(all_v_prices) if all_v_prices else 0.0
             
-            # Update pricelists as well
-            woo_instance.woo_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_price)
-            if woo_instance.woo_extra_pricelist_id:
-                woo_instance.woo_extra_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_sale_price)
-        
-        # Update product descriptions from WooCommerce to Odoo fields
-        if woo_template.woo_description or woo_template.woo_short_description:
-            description_vals = {}
-            if woo_template.woo_description:
-                description_vals['website_description'] = woo_template.woo_description  # Product Description field
-            if woo_template.woo_short_description:
-                description_vals['description_sale'] = woo_template.woo_short_description  # Sales Description field
-            if description_vals:
-                woo_template.product_tmpl_id.write(description_vals)
-        
-        if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
-            self.update_product_images(product_response["images"], {}, woo_template, woo_product, False)
-        if woo_template:
-            return woo_template
-        return True
+            for v in product_response.get("variations", []):
+                if isinstance(v, dict):
+                    orig_price = float(v.get("regular_price") or v.get("price") or 0.0)
+                    v['regular_price'] = str(orig_price - v_min_price)
+                    v['price'] = str(orig_price - v_min_price)
+                    
+                    orig_sale = float(v.get("sale_price") or 0.0)
+                    if orig_sale > 0:
+                        v['sale_price'] = str(orig_sale - v_min_price)
+            
+            product_response.update({
+                '_prices_normalized': True,
+                '_min_base_price': v_min_price
+            })
+        # ======================================================================
+
+        template_images_updated = False
+        variant_price_map = {}
+
+        # 2. Native execution loop correctly routed through woo_variant_env
+        for variant in product_response.get("variations", []):
+            if not isinstance(variant, dict):
+                continue
+                
+            # 🟢 FIX: Route these calls through the variant environment model, NOT self!
+            woo_product = woo_variant_env.search_woo_variant_product_ept(variant.get("sku"), variant.get("id"))
+            product_dict = woo_variant_env.prepare_woo_product_dict_ept(variant, woo_instance, common_log_book_id, model_id)
+            
+            if woo_product:
+                woo_variant_env.update_woo_variant_product_ept(woo_product, variant, product_dict, common_log_book_id, model_id)
+            else:
+                woo_product = woo_variant_env.create_woo_variant_product_ept(variant, product_dict, woo_template,
+                                                                             common_log_book_id, model_id)
+            
+            if woo_product:
+                woo_variant_env.woo_variant_attribute_process(variant, woo_instance, woo_template, woo_product,
+                                                               common_log_book_id, model_id)
+                
+                variant_price_float = float(variant.get("regular_price") or 0.0)
+                if woo_product.product_id:
+                    variant_price_map[woo_product.product_id] = variant_price_float
+
+                if woo_template and (woo_template.woo_description or woo_template.woo_short_description):
+                    description_vals = {}
+                    if woo_template.woo_description:
+                        description_vals['website_description'] = woo_template.woo_description
+                    if woo_template.woo_short_description:
+                        description_vals['description_sale'] = woo_template.woo_short_description
+                    if description_vals:
+                        woo_template.product_tmpl_id.write(description_vals)
+
+                update_images = woo_instance.sync_images_with_product
+                if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
+                    if woo_template and not woo_template.product_tmpl_id.image_1920:
+                        product_dict.update({'product_tmpl_id': woo_template.product_tmpl_id, 'is_image': True})
+                    # 🟢 FIX: Image sync also belongs to the variant environment model
+                    woo_variant_env.update_product_images(product_response.get("images", []), variant.get("image"),
+                                                         woo_template, woo_product, template_images_updated, product_dict)
+                    template_images_updated = True
+
+        # ======================================================================
+        # 🔴 POST-COMMIT TRANSACTION LOCK & PRICELIST ENTRY CORRECTION
+        # ======================================================================
+        try:
+            v_base_min = product_response.get('_min_base_price', 0.0)
+            
+            if update_price and woo_template and woo_template.product_tmpl_id and v_base_min > 0:
+                woo_template.product_tmpl_id.write({'list_price': v_base_min})
+                woo_template.product_tmpl_id.env.flush_all()
+                
+                for product_id in woo_template.product_tmpl_id.product_variant_ids:
+                    v_reg_price = v_base_min + product_id.price_extra
+                    
+                    woo_product_for_price = self.env['woo.product.product.ept'].search([
+                        ('product_id', '=', product_id.id),
+                        ('woo_instance_id', '=', woo_instance.id)
+                    ], limit=1)
+                    
+                    if woo_product_for_price:
+                        woo_instance.woo_pricelist_id.set_product_price_ept(woo_product_for_price.id, v_reg_price)
+                        woo_instance.woo_pricelist_id.env.flush_all()
+        except Exception:
+            pass
+        # ======================================================================
+
+        return woo_template
 
     @api.model
     def update_products_in_woo(self, instance, templates, update_price, publish, update_image,
