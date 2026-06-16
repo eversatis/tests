@@ -1603,6 +1603,83 @@ class WooProductTemplateEpt(models.Model):
                          product_queue_id if order_queue_line else product_data_queue_line.queue_id.name)
         return True
 
+    def sync_woo_product_prices_directly(self, woo_template, woo_product_response):
+        """
+         由 OpenClaw 集成的直接同步 WooCommerce 价格到 Odoo 表单函数
+         :param woo_template: 刚刚创建/更新完成的 woo.product.template.ept 记录对象
+         :param woo_product_response: 对应解包后的 WooCommerce 单个产品原始 Dict/JSON 数据
+         """
+        _logger = logging.getLogger("WooCommerce_Price_Fix")
+        odoo_template = woo_template.product_tmpl_id
+        if not odoo_template:
+            return False
+
+        # 1. 处理简单商品 (Simple Product)
+        if woo_template.woo_product_type == 'simple':
+            reg_price = float(woo_product_response.get('regular_price') or 0.0)
+            sale_price = float(woo_product_response.get('sale_price') or 0.0)
+            final_price = sale_price if sale_price > 0 else reg_price
+
+            odoo_template.write({'list_price': final_price})
+            _logger.info("简单商品 [%s] 价格直接同步成功: %s", odoo_template.name, final_price)
+            return True
+
+        # 2. 处理变体商品 (Variable Product)
+        variants_data = woo_product_response.get('variations', [])
+        if not variants_data:
+            return False
+
+        price_mapping = []
+        woo_product_product_obj = self.env['woo.product.product.ept']
+
+        # 循环提取 WooCommerce 各个变体的实时价格
+        for variant_data in variants_data:
+            v_reg_price = float(variant_data.get('regular_price') or 0.0)
+            v_sale_price = float(variant_data.get('sale_price') or 0.0)
+            v_final_price = v_sale_price if v_sale_price > 0 else v_reg_price
+
+            woo_variant_id = str(variant_data.get('id'))
+
+            # 匹配当前的 Odoo 变体记录
+            woo_variant = woo_product_product_obj.search([
+                ('variant_id', '=', woo_variant_id),
+                ('woo_template_id', '=', woo_template.id),
+                ('woo_instance_id', '=', woo_template.woo_instance_id.id)
+            ], limit=1)
+
+            if woo_variant and woo_variant.product_id:
+                price_mapping.append({
+                    'odoo_variant': woo_variant.product_id,
+                    'price': v_final_price
+                })
+
+        if not price_mapping:
+            _logger.warning("变体商品 [%s] 未在 Odoo 中找到任何对应变体实例，跳过价格同步。", woo_template.name)
+            return False
+
+        # 核心算法：找出价格最低的变体
+        min_price_item = min(price_mapping, key=lambda x: x['price'])
+        min_price = min_price_item['price']
+
+        # 最低价写入模板
+        odoo_template.write({'list_price': min_price})
+
+        # 计算差价写入 product.template.attribute.value
+        for item in price_mapping:
+            odoo_variant = item['odoo_variant']
+            target_price = item['price']
+            extra_price_needed = target_price - min_price
+
+            ptavs = odoo_variant.product_template_attribute_value_ids
+            if ptavs:
+                # 先将所有关联属性加价归零，避免多次同步或多属性叠加放大价格
+                ptavs.write({'price_extra': 0.0})
+                # 将完整的差价补在第一个属性值上
+                ptavs[0].write({'price_extra': extra_price_needed})
+
+        _logger.info("多变体商品 [%s] 价格及变体差价直接同步成功。模板底价: %s", odoo_template.name, min_price)
+        return True
+
     def prepare_product_response(self, order_queue_line, product_data_queue_line):
         """
         This method used Prepare a product response from order data queue or product data queue.
@@ -1905,11 +1982,12 @@ class WooProductTemplateEpt(models.Model):
             update_images = woo_instance.sync_images_with_product
             
             # Update product prices in the product itself
-            if update_price:
-                woo_instance.woo_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_price)
-                if woo_instance.woo_extra_pricelist_id:
-                    woo_instance.woo_extra_pricelist_id.set_product_price_ept(woo_product.product_id.id,
-                                                                              variant_sale_price)
+            # Skipping pricelist price setting as we use direct price sync method
+            # if update_price:
+            #     woo_instance.woo_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_price)
+            #     if woo_instance.woo_extra_pricelist_id:
+            #         woo_instance.woo_extra_pricelist_id.set_product_price_ept(woo_product.product_id.id,
+            #                                                                   variant_sale_price)
             
             # Update product descriptions from WooCommerce to Odoo fields
             if woo_template.woo_description or woo_template.woo_short_description:
@@ -1920,6 +1998,10 @@ class WooProductTemplateEpt(models.Model):
                     description_vals['description_sale'] = woo_template.woo_short_description  # Sales Description field
                 if description_vals:
                     woo_template.product_tmpl_id.write(description_vals)
+            
+            # Call direct price synchronization to bypass pricelist logic
+            if update_price:
+                self.sync_woo_product_prices_directly(woo_template, product_response)
             
             if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
                 if not woo_template.product_tmpl_id.image_1920:
@@ -2050,10 +2132,11 @@ class WooProductTemplateEpt(models.Model):
                                                                    sync_category_and_tags, woo_instance)
                 woo_template.write(woo_template_vals)
             woo_product.write(variant_info)
-        if update_price:
-            woo_instance.woo_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_price)
-            if woo_instance.woo_extra_pricelist_id:
-                woo_instance.woo_extra_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_sale_price)
+        # Skipping pricelist price setting as we use direct price sync method
+        # if update_price:
+        #     woo_instance.woo_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_price)
+        #     if woo_instance.woo_extra_pricelist_id:
+        #         woo_instance.woo_extra_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_sale_price)
         
         # Update product descriptions from WooCommerce to Odoo fields
         if woo_template.woo_description or woo_template.woo_short_description:
@@ -2064,6 +2147,10 @@ class WooProductTemplateEpt(models.Model):
                 description_vals['description_sale'] = woo_template.woo_short_description  # Sales Description field
             if description_vals:
                 woo_template.product_tmpl_id.write(description_vals)
+        
+        # Call direct price synchronization to bypass pricelist logic
+        if update_price:
+            self.sync_woo_product_prices_directly(woo_template, product_response)
         
         if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
             self.update_product_images(product_response["images"], {}, woo_template, woo_product, False)
