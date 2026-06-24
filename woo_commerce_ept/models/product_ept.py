@@ -785,10 +785,11 @@ class WooProductTemplateEpt(models.Model):
         if total_result and not template_id:
             queues = woo_process_import_export.woo_import_products(total_result)
             product_queue_ids = queues.mapped('id')
-            message = "Product Queue created ", queues.mapped('name')
-            bus_bus_obj._sendone(self.env.user.partner_id, 'simple_notification',
-                                 {'title': 'WooCommerce Connector', 'message': message, "sticky": False,
-                                  "warning": True})
+            # Commenting out the notification that causes VToggler error in Owl framework
+            # message = "Product Queue created ", queues.mapped('name')
+            # bus_bus_obj._sendone(self.env.user.partner_id, 'simple_notification',
+            #                      {'title': 'WooCommerce Connector', 'message': message, "sticky": False,
+            #                       "warning": True})
             self._cr.commit()
         return product_queue_ids
 
