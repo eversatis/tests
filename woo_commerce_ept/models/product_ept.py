@@ -1374,7 +1374,11 @@ class WooProductTemplateEpt(models.Model):
                                                               ("woo_image_id", "=", image_id)])
             if not woo_product_image:
                 try:
-                    response = requests.get(url, stream=True, verify=True, timeout=10)
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Content-Type': 'image/jpeg'
+                    }
+                    response = requests.get(url, stream=True, verify=True, timeout=10, headers=headers, allow_redirects=True)
                     if response.status_code == 200:
                         image = base64.b64encode(response.content)
                         key = hashlib.md5(image).hexdigest()
@@ -1386,6 +1390,15 @@ class WooProductTemplateEpt(models.Model):
                             woo_product_image = self.find_or_create_common_product_image(woo_template, image, url)
                             if woo_product_image:
                                 woo_product_image.woo_image_id = image_id
+                                # Explicitly link and update the multi-store e-commerce mapping records
+                                woo_product_image.write({
+                                    'woo_template_id': woo_template.id
+                                })
+                                common_img = woo_product_image.odoo_image_id
+                                if common_img:
+                                    common_img.write({
+                                        'template_id': woo_template.product_tmpl_id.id
+                                    })
                 except Exception:
                     pass
             woo_product_images += woo_product_image
@@ -1410,7 +1423,11 @@ class WooProductTemplateEpt(models.Model):
                                                           ("woo_image_id", "=", image_id)])
         if not woo_product_image:
             try:
-                response = requests.get(url, stream=True, verify=True, timeout=10)
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Content-Type': 'image/jpeg'
+                }
+                response = requests.get(url, stream=True, verify=True, timeout=10, headers=headers, allow_redirects=True)
                 if response.status_code == 200:
                     image = base64.b64encode(response.content)
                     key = hashlib.md5(image).hexdigest()
@@ -1425,6 +1442,17 @@ class WooProductTemplateEpt(models.Model):
                                                                                      product_dict, woo_product)
                         if woo_product_image:
                             woo_product_image.woo_image_id = image_id
+                            # Secure exact multi-store architecture links to prevent Odoo from skipping variant sync
+                            woo_product_image.write({
+                                'woo_template_id': woo_template.id,
+                                'woo_variant_id': woo_product.id
+                            })
+                            common_img = woo_product_image.odoo_image_id
+                            if common_img:
+                                common_img.write({
+                                    'template_id': woo_template.product_tmpl_id.id,
+                                    'product_id': woo_product.product_id.id
+                                })
             except Exception:
                 pass
         return woo_product_image
@@ -1450,7 +1478,27 @@ class WooProductTemplateEpt(models.Model):
         # Get the product template to update images
         product_tmpl = woo_template.product_tmpl_id
         
-        # Process template images - skip the first image as it's the main image
+        # Process template images - the first image should be set as the main template image
+        template_main_image_processed = False
+        if template_images:
+            first_image = template_images[0]
+            first_image_url = first_image.get('src')
+            if first_image_url and first_image_url != 'None':
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Content-Type': 'image/jpeg'
+                    }
+                    response = requests.get(first_image_url, stream=True, verify=False, timeout=10, headers=headers, allow_redirects=True)
+                    if response.status_code == 200:
+                        image_base64 = base64.b64encode(response.content)
+                        # Force set the template main image for multisite compatibility
+                        product_tmpl.image_1920 = image_base64
+                        template_main_image_processed = True
+                except Exception as e:
+                    _logger.error(f"Failed to download template main image from {first_image_url}: {str(e)}")
+        
+        # Process remaining images as additional images if any
         additional_images = template_images[1:] if len(template_images) > 1 else []  # Ensure we only take additional images
         
         for img_data in additional_images:
@@ -1466,7 +1514,11 @@ class WooProductTemplateEpt(models.Model):
                         continue
                     
                     # Download image from URL
-                    response = requests.get(image_url, stream=True, verify=False, timeout=10)
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Content-Type': 'image/jpeg'
+                    }
+                    response = requests.get(image_url, stream=True, verify=False, timeout=10, headers=headers, allow_redirects=True)
                     if response.status_code == 200:
                         image_base64 = base64.b64encode(response.content)
                         
@@ -1485,16 +1537,21 @@ class WooProductTemplateEpt(models.Model):
                     _logger.error(f"Failed to download or save image from {image_url}: {str(e)}")
         
         # Handle main product image if needed, ensuring no duplicates are added to additional images
+        # Force update for multisite scenarios, not just when image is empty
         if variant_image and variant_image.get('src'):
             main_image_url = variant_image.get('src')
-            if not woo_product.product_id.image_1920:
-                try:
-                    response = requests.get(main_image_url, stream=True, verify=False, timeout=10)
-                    if response.status_code == 200:
-                        image_base64 = base64.b64encode(response.content)
-                        woo_product.product_id.image_1920 = image_base64
-                except Exception as e:
-                    _logger.error(f"Failed to download main image from {main_image_url}: {str(e)}")
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Content-Type': 'image/jpeg'
+                }
+                response = requests.get(main_image_url, stream=True, verify=False, timeout=10, headers=headers, allow_redirects=True)
+                if response.status_code == 200:
+                    image_base64 = base64.b64encode(response.content)
+                    # Force set the image for multisite compatibility, overriding existing image
+                    woo_product.product_id.image_1920 = image_base64
+            except Exception as e:
+                _logger.error(f"Failed to download main image from {main_image_url}: {str(e)}")
             
 
         
@@ -1929,12 +1986,10 @@ class WooProductTemplateEpt(models.Model):
                     woo_template = self.create(woo_template_vals)
                     
                     # Update product descriptions from WooCommerce to Odoo fields when creating new template
-                    if template_info.get('woo_description') or template_info.get('woo_short_description'):
+                    if template_info.get('woo_description'):
                         description_vals = {}
                         if template_info.get('woo_description'):
                             description_vals['website_description'] = template_info['woo_description']
-                        if template_info.get('woo_short_description'):
-                            description_vals['description_sale'] = template_info['woo_short_description']  # Sales Description field
                         if description_vals:
                             odoo_template.write(description_vals)
                 elif not template_updated:
@@ -1991,12 +2046,10 @@ class WooProductTemplateEpt(models.Model):
             #                                                                   variant_sale_price)
             
             # Update product descriptions from WooCommerce to Odoo fields
-            if woo_template.woo_description or woo_template.woo_short_description:
+            if woo_template.woo_description:
                 description_vals = {}
                 if woo_template.woo_description:
                     description_vals['website_description'] = woo_template.woo_description
-                if woo_template.woo_short_description:
-                    description_vals['description_sale'] = woo_template.woo_short_description  # Sales Description field
                 if description_vals:
                     woo_template.product_tmpl_id.write(description_vals)
             
@@ -2004,7 +2057,7 @@ class WooProductTemplateEpt(models.Model):
             if update_price:
                 self.sync_woo_product_prices_directly(woo_template, product_response)
             
-            if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
+            if update_images:
                 if not woo_template.product_tmpl_id.image_1920:
                     product_dict.update(
                         {'product_tmpl_id': woo_template.product_tmpl_id, 'is_image': True})
@@ -2116,12 +2169,10 @@ class WooProductTemplateEpt(models.Model):
                 woo_template = self.create(woo_template_vals)
                 
                 # Update product descriptions from WooCommerce to Odoo fields when creating new template
-                if template_info.get('woo_description') or template_info.get('woo_short_description'):
+                if template_info.get('woo_description'):
                     description_vals = {}
                     if template_info.get('woo_description'):
                         description_vals['website_description'] = template_info['woo_description']
-                    if template_info.get('woo_short_description'):
-                        description_vals['description_sale'] = template_info['woo_short_description']  # Sales Description field
                     if description_vals:
                         odoo_template.write(description_vals)
 
@@ -2140,12 +2191,10 @@ class WooProductTemplateEpt(models.Model):
         #         woo_instance.woo_extra_pricelist_id.set_product_price_ept(woo_product.product_id.id, variant_sale_price)
         
         # Update product descriptions from WooCommerce to Odoo fields
-        if woo_template.woo_description or woo_template.woo_short_description:
+        if woo_template.woo_description:
             description_vals = {}
             if woo_template.woo_description:
                 description_vals['website_description'] = woo_template.woo_description  # Product Description field
-            if woo_template.woo_short_description:
-                description_vals['description_sale'] = woo_template.woo_short_description  # Sales Description field
             if description_vals:
                 woo_template.product_tmpl_id.write(description_vals)
         
@@ -2153,7 +2202,7 @@ class WooProductTemplateEpt(models.Model):
         if update_price:
             self.sync_woo_product_prices_directly(woo_template, product_response)
         
-        if update_images and isinstance(product_queue_id, str) and product_queue_id == 'from Order':
+        if update_images:
             self.update_product_images(product_response["images"], {}, woo_template, woo_product, False)
         if woo_template:
             return woo_template
